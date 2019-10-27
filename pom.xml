@@ -24,6 +24,7 @@
         <mapdb.version>1.0.8</mapdb.version>
         <commons-io.version>2.5</commons-io.version>
         <log4j.version>2.11.1</log4j.version>
+        <lmdbjava.version>0.7.0</lmdbjava.version>
     </properties>
 
     <organization>
@@ -145,6 +146,11 @@
             <groupId>commons-io</groupId>
             <artifactId>commons-io</artifactId>
             <version>${commons-io.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.lmdbjava</groupId>
+            <artifactId>lmdbjava</artifactId>
+            <version>${lmdbjava.version}</version>
         </dependency>
         <!-- Test dependencies -->
         <dependency>
