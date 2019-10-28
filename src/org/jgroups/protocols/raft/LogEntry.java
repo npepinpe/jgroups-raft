@@ -1,6 +1,7 @@
 package org.jgroups.protocols.raft;
 
 import org.jgroups.util.Bits;
+import org.jgroups.util.SizeStreamable;
 import org.jgroups.util.Streamable;
 import org.jgroups.util.Util;
 
@@ -12,7 +13,7 @@ import java.io.DataOutput;
  * @author Bela Ban
  * @since  0.1
  */
-public class LogEntry implements Streamable {
+public class LogEntry implements SizeStreamable {
     protected int     term;     // the term of this entry
     protected byte[]  command;  // the command (interpreted by the state machine)
     protected int     offset;   // may get removed (always 0)
@@ -66,5 +67,8 @@ public class LogEntry implements Streamable {
         return str.toString();
     }
 
-
+    @Override
+    public int serializedSize() {
+        return Integer.BYTES + command.length + 1;
+    }
 }

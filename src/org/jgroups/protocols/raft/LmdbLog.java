@@ -1,6 +1,5 @@
 package org.jgroups.protocols.raft;
 
-import java.io.DataInput;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
@@ -9,11 +8,14 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.function.Function;
 import java.util.function.ObjIntConsumer;
 import org.jgroups.Address;
 import org.jgroups.logging.LogFactory;
 import org.jgroups.util.ByteBufferInputStream;
 import org.jgroups.util.ByteBufferOutputStream;
+import org.jgroups.util.SizeStreamable;
 import org.jgroups.util.Util;
 import org.lmdbjava.ByteBufferProxy;
 import org.lmdbjava.Cursor;
@@ -26,10 +28,9 @@ import org.lmdbjava.PutFlags;
 import org.lmdbjava.Txn;
 
 /**
- * Optimizations to perform/test:
- *  1. Reusable read transactions
- *  1. Is this supposed to be thread-safe? What's the expected concurrency model here?
- *  1. Buffer pools - depends on concurrency model
+ * Optimizations to perform/test: 1. Reusable read transactions 1. Is this supposed to be
+ * thread-safe? What's the expected concurrency model here? 1. Buffer pools - depends on concurrency
+ * model
  */
 @SuppressWarnings("WeakerAccess")
 public class LmdbLog implements Log {
@@ -72,7 +73,7 @@ public class LmdbLog implements Log {
     stateDb = env.openDbi(STATE_DB_NAME, DbiFlags.MDB_CREATE, DbiFlags.MDB_INTEGERKEY);
     logDb = env.openDbi(LOG_DB_NAME, DbiFlags.MDB_CREATE, DbiFlags.MDB_INTEGERKEY);
 
-    // initialize state
+    readState();
   }
 
   @Override
@@ -96,7 +97,7 @@ public class LmdbLog implements Log {
 
     try {
       Files.delete(config.path);
-    } catch (IOException e) {
+    } catch (final IOException e) {
       throw new UncheckedIOException(e);
     }
   }
@@ -107,9 +108,16 @@ public class LmdbLog implements Log {
   }
 
   @Override
-  public Log currentTerm(int new_term) {
-    final ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES).putInt(new_term).flip();
-    stateDb.put(StateKey.CURRENT_TERM.serialized, buffer);
+  public Log currentTerm(final int currentTerm) {
+    if (this.currentTerm == currentTerm) {
+      return this;
+    }
+
+    try (final Txn<ByteBuffer> txn = env.txnWrite()) {
+      this.stateDb.put(StateKey.CURRENT_TERM.serialized, serialize(currentTerm));
+      commitSync(txn);
+      this.currentTerm = currentTerm;
+    }
 
     return this;
   }
@@ -120,20 +128,14 @@ public class LmdbLog implements Log {
   }
 
   @Override
-  public Log votedFor(Address votedFor) {
-    final byte[] serialized;
-    try {
-      serialized = Util.objectToByteBuffer(votedFor);
-    } catch (Exception e) {
-      throwUnchecked(e);
-      return this; // unreachable but compiler doesn't know this
+  public Log votedFor(final Address votedFor) {
+    if (this.votedFor.equals(votedFor)) {
+      return this;
     }
 
-    final ByteBuffer buffer = ByteBuffer.wrap(serialized);
     try (final Txn<ByteBuffer> txn = env.txnWrite()) {
-      this.stateDb.put(StateKey.VOTED_FOR.serialized, buffer);
-      txn.commit();
-      env.sync(true);
+      this.stateDb.put(StateKey.VOTED_FOR.serialized, serialize(votedFor));
+      commitSync(txn);
       this.votedFor = votedFor;
     }
 
@@ -146,13 +148,14 @@ public class LmdbLog implements Log {
   }
 
   @Override
-  public Log commitIndex(int commitIndex) {
-    final ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES).putInt(commitIndex).flip();
-    try (final Txn<ByteBuffer> txn = env.txnWrite()) {
-      this.stateDb.put(StateKey.COMMIT_INDEX.serialized, buffer);
+  public Log commitIndex(final int commitIndex) {
+    if (this.commitIndex == commitIndex) {
+      return this;
+    }
 
-      txn.commit();
-      env.sync(true);
+    try (final Txn<ByteBuffer> txn = env.txnWrite()) {
+      this.stateDb.put(StateKey.COMMIT_INDEX.serialized, serialize(commitIndex));
+      commitSync(txn);
       this.commitIndex = commitIndex;
     }
 
@@ -170,59 +173,108 @@ public class LmdbLog implements Log {
   }
 
   @Override
-  public void append(int index, boolean overwrite, LogEntry... entries) {
-    try (final Txn<ByteBuffer> txn = env.txnWrite()) {
-      final ByteBuffer keyBuffer = ByteBuffer.allocate(Integer.BYTES);
-      for (final LogEntry entry : entries) {
-        put(txn, keyBuffer.putInt(index).flip(), entry);
-        index++;
-      }
-
-      txn.commit();
-      env.sync(true);
+  public void append(final int index, final boolean overwrite, final LogEntry... entries) {
+    if (entries.length == 0) {
+      return;
     }
 
+    // todo: use overwrite flag to allow overwrite? seems unsafe
+    int currentIndex = index;
+    try (final Txn<ByteBuffer> txn = env.txnWrite()) {
+      final ByteBuffer keyBuffer = allocate(Integer.BYTES);
+      for (final LogEntry entry : entries) {
+        putEntry(txn, keyBuffer.putInt(0, currentIndex), entry);
+        currentIndex++;
+      }
+
+      commitSync(txn);
+    }
+
+    firstAppended = firstAppended == 0 ? index : firstAppended;
     lastAppended = Math.max(lastAppended, index);
   }
 
   @Override
-  public LogEntry get(int index) {
-    final ByteBuffer keyBuffer = ByteBuffer.allocate(Integer.BYTES).putInt(index).flip();
-
-    try (final Txn<ByteBuffer> txn = env.txnRead()) {
-      final ByteBuffer serialized = stateDb.get(txn, keyBuffer);
-      final LogEntry entry = new LogEntry();
-      final DataInput inputStream = new ByteBufferInputStream(serialized);
-      entry.readFrom(inputStream);
-
-      return entry;
-    } catch (Exception e) {
-      throwUnchecked(e);
-      return null; // unreachable
+  public LogEntry get(final int index) {
+    try (final Txn<ByteBuffer> txn = getReadTxn()) {
+      return get(txn, index).get(); // may throw NoSuchElementException, which is appropriate here
     }
   }
 
   @Override
-  public void truncate(int index) {
+  public void truncate(final int index) {
     if (index <= firstAppended) {
       return;
     }
 
     final int endIndexExclusive = Math.min(commitIndex, index);
-    deleteRange(firstAppended, endIndexExclusive);
-
+    try (final Txn<ByteBuffer> txn = env.txnWrite()) {
+      final OptionalInt lastDeletedIndex = deleteRange(txn, firstAppended, endIndexExclusive);
+      if (lastDeletedIndex.isPresent()) {
+        commitSync(txn);
+        firstAppended = lastDeletedIndex.getAsInt();
+      }
+    }
   }
 
+  /**
+   * Delete all entries starting from start_index (including the entry at start_index). Updates
+   * current_term and last_appended accordingly
+   *
+   * @param startIndexInclusive
+   */
   @Override
-  public void deleteAllEntriesStartingFrom(int startIndexInclusive) {
-    if (startIndexInclusive >= lastAppended) {
+  public void deleteAllEntriesStartingFrom(final int startIndexInclusive) {
+    if (startIndexInclusive < firstAppended || startIndexInclusive > lastAppended) {
+      logger.debug(
+          "Ignoring call to deleteAllEntriesStartingFrom with index {} out bounds ([{}, {}])",
+          startIndexInclusive,
+          firstAppended,
+          lastAppended);
       return;
+    }
+
+    try (final Txn<ByteBuffer> txn = env.txnWrite()) {
+      final OptionalInt lastDeletedIndex = deleteRange(txn, startIndexInclusive, lastAppended + 1);
+      int newLastAppended = lastAppended;
+      int newCurrentTerm = currentTerm;
+      int newFirstAppended = firstAppended;
+      int newCommitIndex = commitIndex;
+
+      if (lastDeletedIndex.isPresent()) {
+        final ByteBuffer buffer = allocate(Integer.BYTES);
+        newLastAppended = Math.max(0, startIndexInclusive - 1);
+        newCommitIndex = Math.min(commitIndex, newLastAppended);
+        final Optional<LogEntry> newLastEntry = get(txn, newLastAppended);
+        if (newLastEntry.isPresent()) {
+          newCurrentTerm = newLastEntry.get().term;
+        } else { // log is now empty, so reset everything
+          newLastAppended = newCurrentTerm = newFirstAppended = newCommitIndex = 0;
+        }
+
+        if (newCurrentTerm != currentTerm) {
+          stateDb.put(txn, StateKey.CURRENT_TERM.serialized, buffer.putInt(0, newCurrentTerm));
+        }
+
+        if (newCommitIndex != commitIndex) {
+          stateDb.put(txn, StateKey.COMMIT_INDEX.serialized, buffer.putInt(0, newCommitIndex));
+        }
+
+        commitSync(txn);
+      }
+
+      firstAppended = newFirstAppended;
+      lastAppended = newLastAppended;
+      currentTerm = newCurrentTerm;
+      commitIndex = newCommitIndex;
     }
   }
 
   @Override
   public void forEach(
-      ObjIntConsumer<LogEntry> function, int startIndexInclusive, int endIndexInclusive) {
+      final ObjIntConsumer<LogEntry> function,
+      final int startIndexInclusive,
+      final int endIndexInclusive) {
     final int start = Math.max(startIndexInclusive, firstAppended);
     final int end = Math.min(endIndexInclusive, lastAppended);
 
@@ -234,7 +286,7 @@ public class LmdbLog implements Log {
         return;
       }
 
-      int index = cursor.key().getInt();
+      final int index = cursor.key().getInt();
       do {
         function.accept(deserialize(cursor.val()), index);
       } while (cursor.next() && index <= end);
@@ -242,49 +294,76 @@ public class LmdbLog implements Log {
   }
 
   @Override
-  public void forEach(ObjIntConsumer<LogEntry> function) {
+  public void forEach(final ObjIntConsumer<LogEntry> function) {
     forEach(function, firstAppended, lastAppended);
   }
 
-  // todo: handle resetting commitIndex, currentTerm, lastAppended, firstAppended
-  protected void deleteRange(final int startIndexInclusive, final int endIndexExclusive) {
-    int lastTerm;
-    int lastIndex;
-
-    try (final Txn<ByteBuffer> txn = env.txnWrite()) {
-      // closing a write transaction will close any opened cursors
-      final Cursor<ByteBuffer> cursor = logDb.openCursor(txn);
-      if (startIndexInclusive < firstAppended) {
-          if (!cursor.first()) { // empty log
-              return;
-          }
-      } else {
-        final ByteBuffer keyBuffer = ByteBuffer.allocate(Integer.BYTES).putInt(startIndexInclusive).flip();
-        // returns false iff no key present greater than startIndex, meaning we have nothing to
-        // delete
-        if (!cursor.get(keyBuffer, GetOp.MDB_SET_KEY)) {
-          return;
-        }
-      }
-
-      do {
-        lastIndex = cursor.key().getInt();
-        if (lastIndex >= endIndexExclusive) {
-          break;
-        }
-        cursor.delete();
-      } while (cursor.next());
-
-
-      txn.commit();
-      env.sync(true);
-    }
-
-    firstAppended = lastIndex;
-
+  protected Optional<LogEntry> get(final Txn<ByteBuffer> txn, final int index) {
+    final ByteBuffer serialized = stateDb.get(txn, serialize(index));
+    return Optional.ofNullable(serialized).map(this::deserialize);
   }
 
-  protected void put(final Txn<ByteBuffer> txn, final ByteBuffer key, final LogEntry entry) {
+  protected void commitSync(final Txn<ByteBuffer> txn) {
+    txn.commit();
+    env.sync(true);
+  }
+
+  protected void readState() {
+    try (final Txn<ByteBuffer> txn = getReadTxn();
+        final Cursor<ByteBuffer> cursor = logDb.openCursor(txn)) {
+      currentTerm = getOrDefault(txn, StateKey.CURRENT_TERM, ByteBuffer::getInt, 0);
+      commitIndex = getOrDefault(txn, StateKey.COMMIT_INDEX, ByteBuffer::getInt, 0);
+      votedFor = getOrDefault(txn, StateKey.VOTED_FOR, this::<Address>deserialize, null);
+
+      if (cursor.first()) {
+        firstAppended = cursor.key().getInt();
+      }
+
+      if (cursor.last()) {
+        lastAppended = cursor.key().getInt();
+      }
+    }
+  }
+
+  protected <T> T getOrDefault(
+      final Txn<ByteBuffer> txn,
+      final StateKey key,
+      final Function<ByteBuffer, T> deserializer,
+      final T defaultValue) {
+    return Optional.ofNullable(stateDb.get(txn, key.serialized))
+        .map(deserializer)
+        .orElse(defaultValue);
+  }
+
+  protected Txn<ByteBuffer> getReadTxn() {
+    return env.txnRead();
+  }
+
+  // todo: handle resetting commitIndex, currentTerm, lastAppended, firstAppended
+  protected OptionalInt deleteRange(
+      final Txn<ByteBuffer> txn, final int startIndexInclusive, final int endIndexExclusive) {
+    // any opened cursors are closed when a transaction is closed, so nothing to worry about here
+    final Cursor<ByteBuffer> cursor = logDb.openCursor(txn);
+    final ByteBuffer keyBuffer = serialize(startIndexInclusive);
+    int lastIndex;
+
+    // returns false iff no key present greater than startIndex, meaning we have nothing to delete
+    if (!cursor.get(keyBuffer, GetOp.MDB_SET_KEY)) {
+      return OptionalInt.empty();
+    }
+
+    do {
+      lastIndex = cursor.key().getInt();
+      if (lastIndex >= endIndexExclusive) {
+        break;
+      }
+      cursor.delete();
+    } while (cursor.next());
+
+    return OptionalInt.of(lastIndex);
+  }
+
+  protected void putEntry(final Txn<ByteBuffer> txn, final ByteBuffer key, final LogEntry entry) {
     final ByteBuffer value = serialize(entry);
 
     // returns false if the key already exists, otherwise throws an exception
@@ -293,28 +372,54 @@ public class LmdbLog implements Log {
     }
   }
 
-  protected ByteBuffer serialize(final LogEntry entry) {
-    final ByteBuffer buffer = ByteBuffer.allocate(entry.length);
+  protected ByteBuffer serialize(final int value) {
+    return allocate(Integer.BYTES).putInt(value).flip();
+  }
+
+  protected ByteBuffer serialize(final SizeStreamable value) {
+    final ByteBuffer buffer = allocate(value.serializedSize());
     final ByteBufferOutputStream outputStream = new ByteBufferOutputStream(buffer);
     try {
-      entry.writeTo(outputStream);
-    } catch (Exception e) {
+      Util.objectToStream(value, outputStream);
+    } catch (final Exception e) {
       throwUnchecked(e);
     }
 
     return buffer;
   }
 
-  protected LogEntry deserialize(final ByteBuffer buffer) {
-    final LogEntry entry = new LogEntry();
-    final ByteBufferInputStream inputStream = new ByteBufferInputStream(buffer);
+  protected <T extends SizeStreamable> T deserialize(final ByteBuffer buffer) {
     try {
-      entry.readFrom(inputStream);
-    } catch (Exception e) {
+      return Util.objectFromStream(new ByteBufferInputStream(buffer));
+    } catch (final Exception e) {
       throwUnchecked(e);
+      return null; // unreachable
     }
+  }
 
-    return entry;
+  protected static ByteBuffer allocate(final int size) {
+    return ByteBuffer.allocateDirect(size);
+  }
+
+  @SuppressWarnings("unchecked")
+  protected static <T extends Throwable> void throwUnchecked(final Throwable t) throws T {
+    throw (T) t;
+  }
+
+  // for backwards compatibility, keep track of values and ensure they are never overwritten or
+  // changed
+  enum StateKey {
+    CURRENT_TERM(0),
+    COMMIT_INDEX(1),
+    VOTED_FOR(2);
+
+    protected final int value;
+    protected final ByteBuffer serialized;
+
+    StateKey(final int value) {
+      this.value = value;
+      this.serialized = allocate(Integer.BYTES).putInt(ordinal()).flip();
+    }
   }
 
   static class Configuration {
@@ -345,7 +450,7 @@ public class LmdbLog implements Log {
         } else {
           path = Files.createTempDirectory(logName);
         }
-      } catch (IOException e) {
+      } catch (final IOException e) {
         throw new UncheckedIOException(e);
       }
 
@@ -359,28 +464,5 @@ public class LmdbLog implements Log {
     Path getPath() {
       return path;
     }
-  }
-
-  // for backwards compatibility, keep track of values and ensure they are never overwritten or
-  // changed
-  enum StateKey {
-    FIRST_APPENDED(0),
-    LAST_APPENDED(1),
-    CURRENT_TERM(2),
-    COMMIT_INDEX(3),
-    VOTED_FOR(4);
-
-    protected final int value;
-    protected final ByteBuffer serialized;
-
-    StateKey(final int value) {
-      this.value = value;
-      this.serialized = ByteBuffer.allocate(Integer.BYTES).putInt(ordinal()).flip();
-    }
-  }
-
-  @SuppressWarnings("unchecked")
-  protected static <T extends Throwable> void throwUnchecked(final Throwable t) throws T {
-    throw (T) t;
   }
 }
