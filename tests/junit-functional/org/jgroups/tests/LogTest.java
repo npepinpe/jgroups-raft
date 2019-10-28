@@ -4,6 +4,7 @@ import org.jgroups.Address;
 import org.jgroups.Global;
 import org.jgroups.protocols.raft.InMemoryLog;
 import org.jgroups.protocols.raft.LevelDBLog;
+import org.jgroups.protocols.raft.LmdbLog;
 import org.jgroups.protocols.raft.Log;
 import org.jgroups.protocols.raft.LogEntry;
 import org.jgroups.util.Util;
@@ -30,7 +31,8 @@ public class LogTest {
         return new Object[][] {
           /*{new MapDBLog()},*/
           {new LevelDBLog()},
-          {new InMemoryLog()}
+          {new InMemoryLog()},
+          {new LmdbLog()},
         };
     }
 

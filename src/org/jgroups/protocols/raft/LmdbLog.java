@@ -1,14 +1,19 @@
 package org.jgroups.protocols.raft;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Collections;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.locks.Lock;
 import java.util.function.Function;
 import java.util.function.ObjIntConsumer;
@@ -17,7 +22,6 @@ import org.jgroups.logging.LogFactory;
 import org.jgroups.util.ByteBufferInputStream;
 import org.jgroups.util.ByteBufferOutputStream;
 import org.jgroups.util.Pool;
-import org.jgroups.util.Pool.Element;
 import org.jgroups.util.SizeStreamable;
 import org.jgroups.util.Util;
 import org.lmdbjava.ByteBufferProxy;
@@ -29,6 +33,7 @@ import org.lmdbjava.EnvFlags;
 import org.lmdbjava.GetOp;
 import org.lmdbjava.PutFlags;
 import org.lmdbjava.Txn;
+import org.mapdb.Atomic;
 
 /**
  * Optimizations to perform/test: 1. Reusable read transactions 1. Is this supposed to be
@@ -62,7 +67,7 @@ public class LmdbLog implements Log {
   @Override
   public void init(final String logName, final Map<String, String> args) throws Exception {
     logger = LogFactory.getLog(String.format("%s-%s", getClass().getName(), logName));
-    config = Configuration.parse(logName, args);
+    config = Configuration.parse(logName, args == null ? Collections.emptyMap() : args);
 
     env =
         Env.create(ByteBufferProxy.PROXY_SAFE)
@@ -79,7 +84,7 @@ public class LmdbLog implements Log {
                 EnvFlags.MDB_NOTLS);
     stateDb = env.openDbi(STATE_DB_NAME, DbiFlags.MDB_CREATE, DbiFlags.MDB_INTEGERKEY);
     logDb = env.openDbi(LOG_DB_NAME, DbiFlags.MDB_CREATE, DbiFlags.MDB_INTEGERKEY);
-    txnPool = new TransactionPool(env, config.getTxnPoolSize());
+    txnPool = new TransactionPool(config.getTxnPoolSize());
 
     readState();
   }
@@ -92,6 +97,10 @@ public class LmdbLog implements Log {
 
     if (stateDb != null) {
       stateDb.close();
+    }
+
+    if (txnPool != null) {
+      txnPool.close();
     }
 
     if (env != null) {
@@ -205,8 +214,8 @@ public class LmdbLog implements Log {
   @Override
   public LogEntry get(final int index) {
     try (final ReusableTransaction txn = txnPool.acquire()) {
-      return get(txn.get(), index)
-          .get(); // may throw NoSuchElementException, which is appropriate here
+      // may throw NoSuchElementException, which is appropriate here
+      return get(txn.get(), index).get();
     }
   }
 
@@ -237,6 +246,7 @@ public class LmdbLog implements Log {
       return;
     }
 
+    // todo: simplify this whole thing
     try (final Txn<ByteBuffer> txn = env.txnWrite()) {
       final OptionalInt lastDeletedIndex = deleteRange(txn, startIndexInclusive, lastAppended + 1);
       int newLastAppended = lastAppended;
@@ -283,7 +293,7 @@ public class LmdbLog implements Log {
 
     try (final ReusableTransaction txn = txnPool.acquire();
         final Cursor<ByteBuffer> cursor = logDb.openCursor(txn.get())) {
-      final ByteBuffer keyBuffer = ByteBuffer.allocate(Integer.BYTES).putInt(start).flip();
+      final ByteBuffer keyBuffer = ByteBuffer.allocate(Integer.BYTES).putInt(0, start);
       if (!cursor.get(keyBuffer, GetOp.MDB_SET_KEY)) {
         logger.debug("No log entry found at index {}", start);
         return;
@@ -376,14 +386,14 @@ public class LmdbLog implements Log {
   }
 
   protected ByteBuffer serialize(final int value) {
-    return allocate(Integer.BYTES).putInt(value).flip();
+    return allocate(Integer.BYTES).putInt(0, value);
   }
 
   protected ByteBuffer serialize(final SizeStreamable value) {
     final ByteBuffer buffer = allocate(value.serializedSize());
     final ByteBufferOutputStream outputStream = new ByteBufferOutputStream(buffer);
     try {
-      Util.objectToStream(value, outputStream);
+      value.writeTo(outputStream);
     } catch (final Exception e) {
       throwUnchecked(e);
     }
@@ -421,7 +431,7 @@ public class LmdbLog implements Log {
 
     StateKey(final int value) {
       this.value = value;
-      this.serialized = allocate(Integer.BYTES).putInt(ordinal()).flip();
+      this.serialized = allocate(Integer.BYTES).putInt(0, ordinal());
     }
   }
 
@@ -482,43 +492,84 @@ public class LmdbLog implements Log {
   }
 
   protected static class ReusableTransaction implements AutoCloseable {
-    private final Element<Txn<ByteBuffer>> element;
+    protected final Txn<ByteBuffer> txn;
+    protected final TransactionPool pool;
 
-    ReusableTransaction(final Element<Txn<ByteBuffer>> element) {
-      this.element = element;
+    public ReusableTransaction(final TransactionPool pool, final Txn<ByteBuffer> txn) {
+      this.pool = pool;
+      this.txn = txn;
     }
 
     Txn<ByteBuffer> get() {
-      return element.getElement();
+      return txn;
     }
 
     @Override
     public void close() {
-      final Lock lock = element.getLock();
-      final Txn<ByteBuffer> txn = this.element.getElement();
-
-      // if we have no lock then this txn is not put back on the pool, so close it
-      if (lock != null) {
-        txn.reset();
-        lock.unlock();
-      } else {
-        txn.close();
-      }
+      pool.release(this);
     }
   }
 
-  protected static class TransactionPool extends Pool<Txn<ByteBuffer>> {
-    TransactionPool(final Env<ByteBuffer> env, final int capacity) {
-      super(capacity, env::txnRead);
+  protected class TransactionPool implements Closeable {
+    protected final AtomicReferenceArray<ReusableTransaction> pool;
+    protected final AtomicInteger stackIndex;
+
+    protected AtomicBoolean isClosed;
+
+    protected TransactionPool(final int capacity) {
+      this.pool = new AtomicReferenceArray<>(capacity);
+      this.stackIndex = new AtomicInteger(0);
+      this.isClosed = new AtomicBoolean(false);
     }
 
-    ReusableTransaction acquire() {
-      final Element<Txn<ByteBuffer>> element = get();
-      if (element.getLock() != null) { // reusable object
-        element.getElement().renew();
+    @Override
+    public void close() {
+      isClosed.set(true);
+      for (int i = 0; i < pool.length(); i++) {
+        pool.getAndSet(i, null).get().close();
+      }
+      stackIndex.set(0);
+    }
+
+    protected ReusableTransaction acquire() {
+      while (true) {
+        int currentIndex;
+        do {
+          currentIndex = stackIndex.get();
+          if (currentIndex == 0) { // pool is empty
+            return allocate();
+          }
+        } while (!stackIndex.compareAndSet(currentIndex, currentIndex - 1));
+
+        final ReusableTransaction txn = pool.getAndSet(currentIndex - 1, null);
+        if (txn != null) {
+          txn.get().renew();
+          return txn;
+        }
+      }
+    }
+
+    protected void release(ReusableTransaction txn) {
+      while (!isClosed.get()) {
+        int currentIndex;
+        do {
+          currentIndex = stackIndex.get();
+          if (currentIndex >= pool.length()) { // pool is full, close txn
+            txn.get().close();
+          }
+        } while (!stackIndex.compareAndSet(currentIndex, currentIndex + 1));
+
+        if (pool.compareAndSet(currentIndex, null, txn)) {
+          txn.get().reset();
+          return;
+        }
       }
 
-      return new ReusableTransaction(element);
+      txn.get().close();
+    }
+
+    protected ReusableTransaction allocate() {
+      return new ReusableTransaction(this, env.txnRead());
     }
   }
 }
