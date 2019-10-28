@@ -39,6 +39,9 @@ import org.lmdbjava.Txn;
 public class LmdbLog implements Log {
   protected static final String STATE_DB_NAME = "state";
   protected static final String LOG_DB_NAME = "log";
+  protected static final PutFlags[] OVERWRITE_FLAGS = new PutFlags[] {PutFlags.MDB_APPEND};
+  protected static final PutFlags[] NO_OVERWRITE_FLAGS =
+      new PutFlags[] {PutFlags.MDB_APPEND, PutFlags.MDB_NOOVERWRITE};
 
   protected org.jgroups.logging.Log logger;
   protected Configuration config;
@@ -183,12 +186,12 @@ public class LmdbLog implements Log {
       return;
     }
 
-    // todo: use overwrite flag to allow overwrite? seems unsafe
+    final PutFlags[] flags = overwrite ? OVERWRITE_FLAGS : NO_OVERWRITE_FLAGS;
     int currentIndex = index;
     try (final Txn<ByteBuffer> txn = env.txnWrite()) {
       final ByteBuffer keyBuffer = allocate(Integer.BYTES);
       for (final LogEntry entry : entries) {
-        putEntry(txn, keyBuffer.putInt(0, currentIndex), entry);
+        putEntry(txn, keyBuffer.putInt(0, currentIndex), entry, flags);
         currentIndex++;
       }
 
@@ -359,11 +362,15 @@ public class LmdbLog implements Log {
     return OptionalInt.of(lastIndex);
   }
 
-  protected void putEntry(final Txn<ByteBuffer> txn, final ByteBuffer key, final LogEntry entry) {
+  protected void putEntry(
+      final Txn<ByteBuffer> txn,
+      final ByteBuffer key,
+      final LogEntry entry,
+      final PutFlags... flags) {
     final ByteBuffer value = serialize(entry);
 
     // returns false if the key already exists, otherwise throws an exception
-    if (!logDb.put(txn, key, value, PutFlags.MDB_APPEND)) {
+    if (!logDb.put(txn, key, value, flags)) {
       logger.trace("Log entry already exists at index {}", key.getInt());
     }
   }
