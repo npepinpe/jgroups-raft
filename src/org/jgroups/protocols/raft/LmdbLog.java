@@ -9,12 +9,15 @@ import java.nio.file.Paths;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.concurrent.locks.Lock;
 import java.util.function.Function;
 import java.util.function.ObjIntConsumer;
 import org.jgroups.Address;
 import org.jgroups.logging.LogFactory;
 import org.jgroups.util.ByteBufferInputStream;
 import org.jgroups.util.ByteBufferOutputStream;
+import org.jgroups.util.Pool;
+import org.jgroups.util.Pool.Element;
 import org.jgroups.util.SizeStreamable;
 import org.jgroups.util.Util;
 import org.lmdbjava.ByteBufferProxy;
@@ -43,6 +46,7 @@ public class LmdbLog implements Log {
   protected Env<ByteBuffer> env;
   protected Dbi<ByteBuffer> logDb;
   protected Dbi<ByteBuffer> stateDb;
+  protected TransactionPool txnPool;
 
   protected int currentTerm = 0;
   protected int commitIndex = 0;
@@ -59,10 +63,10 @@ public class LmdbLog implements Log {
 
     env =
         Env.create(ByteBufferProxy.PROXY_SAFE)
-            .setMapSize(config.maxMapSize)
+            .setMapSize(config.getMaxMapSize())
             .setMaxDbs(2)
             .open(
-                config.path.toFile(),
+                config.getPath().toFile(),
                 // perform all writes asynchronously to optimize batch writes by flushing manually
                 // once a batch is finished
                 EnvFlags.MDB_MAPASYNC,
@@ -72,6 +76,7 @@ public class LmdbLog implements Log {
                 EnvFlags.MDB_NOTLS);
     stateDb = env.openDbi(STATE_DB_NAME, DbiFlags.MDB_CREATE, DbiFlags.MDB_INTEGERKEY);
     logDb = env.openDbi(LOG_DB_NAME, DbiFlags.MDB_CREATE, DbiFlags.MDB_INTEGERKEY);
+    txnPool = new TransactionPool(env, config.getTxnPoolSize());
 
     readState();
   }
@@ -196,8 +201,9 @@ public class LmdbLog implements Log {
 
   @Override
   public LogEntry get(final int index) {
-    try (final Txn<ByteBuffer> txn = getReadTxn()) {
-      return get(txn, index).get(); // may throw NoSuchElementException, which is appropriate here
+    try (final ReusableTransaction txn = txnPool.acquire()) {
+      return get(txn.get(), index)
+          .get(); // may throw NoSuchElementException, which is appropriate here
     }
   }
 
@@ -217,12 +223,6 @@ public class LmdbLog implements Log {
     }
   }
 
-  /**
-   * Delete all entries starting from start_index (including the entry at start_index). Updates
-   * current_term and last_appended accordingly
-   *
-   * @param startIndexInclusive
-   */
   @Override
   public void deleteAllEntriesStartingFrom(final int startIndexInclusive) {
     if (startIndexInclusive < firstAppended || startIndexInclusive > lastAppended) {
@@ -278,8 +278,8 @@ public class LmdbLog implements Log {
     final int start = Math.max(startIndexInclusive, firstAppended);
     final int end = Math.min(endIndexInclusive, lastAppended);
 
-    try (final Txn<ByteBuffer> txn = env.txnRead();
-        final Cursor<ByteBuffer> cursor = logDb.openCursor(txn)) {
+    try (final ReusableTransaction txn = txnPool.acquire();
+        final Cursor<ByteBuffer> cursor = logDb.openCursor(txn.get())) {
       final ByteBuffer keyBuffer = ByteBuffer.allocate(Integer.BYTES).putInt(start).flip();
       if (!cursor.get(keyBuffer, GetOp.MDB_SET_KEY)) {
         logger.debug("No log entry found at index {}", start);
@@ -309,11 +309,11 @@ public class LmdbLog implements Log {
   }
 
   protected void readState() {
-    try (final Txn<ByteBuffer> txn = getReadTxn();
-        final Cursor<ByteBuffer> cursor = logDb.openCursor(txn)) {
-      currentTerm = getOrDefault(txn, StateKey.CURRENT_TERM, ByteBuffer::getInt, 0);
-      commitIndex = getOrDefault(txn, StateKey.COMMIT_INDEX, ByteBuffer::getInt, 0);
-      votedFor = getOrDefault(txn, StateKey.VOTED_FOR, this::<Address>deserialize, null);
+    try (final ReusableTransaction txn = txnPool.acquire();
+        final Cursor<ByteBuffer> cursor = logDb.openCursor(txn.get())) {
+      currentTerm = getOrDefault(txn.get(), StateKey.CURRENT_TERM, ByteBuffer::getInt, 0);
+      commitIndex = getOrDefault(txn.get(), StateKey.COMMIT_INDEX, ByteBuffer::getInt, 0);
+      votedFor = getOrDefault(txn.get(), StateKey.VOTED_FOR, this::<Address>deserialize, null);
 
       if (cursor.first()) {
         firstAppended = cursor.key().getInt();
@@ -333,10 +333,6 @@ public class LmdbLog implements Log {
     return Optional.ofNullable(stateDb.get(txn, key.serialized))
         .map(deserializer)
         .orElse(defaultValue);
-  }
-
-  protected Txn<ByteBuffer> getReadTxn() {
-    return env.txnRead();
   }
 
   // todo: handle resetting commitIndex, currentTerm, lastAppended, firstAppended
@@ -425,15 +421,19 @@ public class LmdbLog implements Log {
   static class Configuration {
     static final String MAX_MAP_SIZE_PROP = "org.jgroups.protocols.raft.LmdbLog.maxMapSize";
     static final String PATH_PROP = "org.jgroups.protocols.raft.LmdbLog.path";
+    static final String TXN_POOL_SIZE_PROP = "org.jgroups.protocols.raft.LmdbLog.txnPoolSize";
 
     static final long DEFAULT_MAX_MAP_SIZE = 2L * 1024 * 1024 * 1024; // 2GiB
+    static final int DEFAULT_TXN_POOL_SIZE = 8;
 
     private final long maxMapSize;
     private final Path path;
+    private final int txnPoolSize;
 
-    Configuration(final long maxMapSize, final Path path) {
+    Configuration(final long maxMapSize, final Path path, final int txnPoolSize) {
       this.maxMapSize = maxMapSize;
       this.path = path;
+      this.txnPoolSize = txnPoolSize;
     }
 
     static Configuration parse(final String logName, final Map<String, String> args) {
@@ -442,6 +442,10 @@ public class LmdbLog implements Log {
           Optional.ofNullable(args.get(MAX_MAP_SIZE_PROP))
               .map(Long::valueOf)
               .orElse(DEFAULT_MAX_MAP_SIZE);
+      final int txnPoolSize =
+          Optional.ofNullable(args.get(TXN_POOL_SIZE_PROP))
+              .map(Integer::valueOf)
+              .orElse(DEFAULT_TXN_POOL_SIZE);
       final Path path;
 
       try {
@@ -454,7 +458,7 @@ public class LmdbLog implements Log {
         throw new UncheckedIOException(e);
       }
 
-      return new Configuration(maxMapSize, path);
+      return new Configuration(maxMapSize, path, txnPoolSize);
     }
 
     long getMaxMapSize() {
@@ -463,6 +467,51 @@ public class LmdbLog implements Log {
 
     Path getPath() {
       return path;
+    }
+
+    int getTxnPoolSize() {
+      return txnPoolSize;
+    }
+  }
+
+  protected static class ReusableTransaction implements AutoCloseable {
+    private final Element<Txn<ByteBuffer>> element;
+
+    ReusableTransaction(final Element<Txn<ByteBuffer>> element) {
+      this.element = element;
+    }
+
+    Txn<ByteBuffer> get() {
+      return element.getElement();
+    }
+
+    @Override
+    public void close() {
+      final Lock lock = element.getLock();
+      final Txn<ByteBuffer> txn = this.element.getElement();
+
+      // if we have no lock then this txn is not put back on the pool, so close it
+      if (lock != null) {
+        txn.reset();
+        lock.unlock();
+      } else {
+        txn.close();
+      }
+    }
+  }
+
+  protected static class TransactionPool extends Pool<Txn<ByteBuffer>> {
+    TransactionPool(final Env<ByteBuffer> env, final int capacity) {
+      super(capacity, env::txnRead);
+    }
+
+    ReusableTransaction acquire() {
+      final Element<Txn<ByteBuffer>> element = get();
+      if (element.getLock() != null) { // reusable object
+        element.getElement().renew();
+      }
+
+      return new ReusableTransaction(element);
     }
   }
 }
